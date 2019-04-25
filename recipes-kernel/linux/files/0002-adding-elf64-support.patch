@@ -1,0 +1,989 @@
+From 717501d0e786551cd8efd36a766c10bd4c4d7eb3 Mon Sep 17 00:00:00 2001
+From: Yunguo Wei <yunguo.wei@windriver.com>
+Date: Mon, 11 Mar 2019 05:24:39 +0000
+Subject: [PATCH 2/6] adding elf64 support
+
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ drivers/remoteproc/remoteproc_core.c          |   4 +
+ drivers/remoteproc/remoteproc_elf_64_loader.c | 413 +++++++++++++++++++++++++
+ drivers/remoteproc/remoteproc_elf_loader.c    | 418 +++++++++++++++++++++++++-
+ drivers/remoteproc/remoteproc_internal.h      |  12 +-
+ drivers/remoteproc/zynqmp_a53_remoteproc.c    |   9 +-
+ include/linux/remoteproc.h                    |   4 +-
+ 6 files changed, 853 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/remoteproc/remoteproc_elf_64_loader.c
+
+diff --git a/drivers/remoteproc/remoteproc_core.c b/drivers/remoteproc/remoteproc_core.c
+index d68fb4a4004a..37edd5235206 100644
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@ -1080,13 +1080,17 @@ static int rproc_start(struct rproc *rproc, const struct firmware *fw)
+ 		rproc->table_ptr = loaded_table;
+ 	}
+ 
++#if 0
+ 	/* power up the remote processor */
+ 	ret = rproc->ops->start(rproc);
+ 	if (ret) {
+ 		dev_err(dev, "can't start rproc %s: %d\n", rproc->name, ret);
+ 		return ret;
+ 	}
++#else
+ 
++	pr_info("Protending starting remote core...\n");
++#endif
+ 	/* probe any subdevices for the remote processor */
+ 	ret = rproc_probe_subdevices(rproc);
+ 	if (ret) {
+diff --git a/drivers/remoteproc/remoteproc_elf_64_loader.c b/drivers/remoteproc/remoteproc_elf_64_loader.c
+new file mode 100644
+index 000000000000..fe89f9dd3395
+--- /dev/null
++++ b/drivers/remoteproc/remoteproc_elf_64_loader.c
+@@ -0,0 +1,413 @@
++
++/**
++ * rproc_elf64_sanity_check() - Sanity Check ELF firmware image
++ * @rproc: the remote processor handle
++ * @fw: the ELF firmware image
++ *
++ * Make sure this fw image is sane.
++ */
++int rproc_elf64_sanity_check(struct rproc *rproc, const struct firmware *fw)
++{
++	const char *name = rproc->firmware;
++	struct device *dev = &rproc->dev;
++	struct elf64_hdr *ehdr;
++	char class;
++
++	if (!fw) {
++		dev_err(dev, "failed to load %s\n", name);
++		return -EINVAL;
++	}
++
++	if (fw->size < sizeof(struct elf64_hdr)) {
++		dev_err(dev, "Image is too small\n");
++		return -EINVAL;
++	}
++
++	ehdr = (struct elf64_hdr *)fw->data;
++
++	/* We only support elf32 and elf64 at this point */
++	class = ehdr->e_ident[EI_CLASS];
++	if (class != ELFCLASS32 && class != ELFCLASS64) {
++		dev_err(dev, "Unsupported class: %d\n", class);
++		return -EINVAL;
++	}
++
++	/* We assume the firmware has the same endianness as the host */
++# ifdef __LITTLE_ENDIAN
++	if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
++# else /* BIG ENDIAN */
++	if (ehdr->e_ident[EI_DATA] != ELFDATA2MSB) {
++# endif
++		dev_err(dev, "Unsupported firmware endianness\n");
++		return -EINVAL;
++	}
++
++	if (fw->size < ehdr->e_shoff + sizeof(struct elf64_shdr)) {
++		dev_err(dev, "Image is too small\n");
++		return -EINVAL;
++	}
++
++	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG)) {
++		dev_err(dev, "Image is corrupted (bad magic)\n");
++		return -EINVAL;
++	}
++
++	if (ehdr->e_phnum == 0) {
++		dev_err(dev, "No loadable segments\n");
++		return -EINVAL;
++	}
++
++	if (ehdr->e_phoff > fw->size) {
++		dev_err(dev, "Firmware size is too small\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(rproc_elf64_sanity_check);
++
++/**
++ * rproc_elf64_get_boot_addr() - Get rproc's boot address.
++ * @rproc: the remote processor handle
++ * @fw: the ELF firmware image
++ *
++ * This function returns the entry point address of the ELF
++ * image.
++ *
++ * Note that the boot address is not a configurable property of all remote
++ * processors. Some will always boot at a specific hard-coded address.
++ */
++u64 rproc_elf64_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr  = (struct elf64_hdr *)fw->data;
++
++	return ehdr->e_entry;
++}
++EXPORT_SYMBOL(rproc_elf64_get_boot_addr);
++
++/**
++ * rproc_elf64_load_segments() - load firmware segments to memory
++ * @rproc: remote processor which will be booted using these fw segments
++ * @fw: the ELF firmware image
++ *
++ * This function loads the firmware segments to memory, where the remote
++ * processor expects them.
++ *
++ * Some remote processors will expect their code and data to be placed
++ * in specific device addresses, and can't have them dynamically assigned.
++ *
++ * We currently support only those kind of remote processors, and expect
++ * the program header's paddr member to contain those addresses. We then go
++ * through the physically contiguous "carveout" memory regions which we
++ * allocated (and mapped) earlier on behalf of the remote processor,
++ * and "translate" device address to kernel addresses, so we can copy the
++ * segments where they are expected.
++ *
++ * Currently we only support remote processors that required carveout
++ * allocations and got them mapped onto their iommus. Some processors
++ * might be different: they might not have iommus, and would prefer to
++ * directly allocate memory for every segment/resource. This is not yet
++ * supported, though.
++ */
++int rproc_elf64_load_segments(struct rproc *rproc, const struct firmware *fw)
++{
++	struct device *dev = &rproc->dev;
++	struct elf64_hdr *ehdr;
++	struct elf64_phdr *phdr;
++	int i, ret = 0;
++	const u8 *elf_data = fw->data;
++
++	pr_warn("%s(%d): loading elf images!\n", __FILE__, __LINE__);
++	ehdr = (struct elf64_hdr *)elf_data;
++	phdr = (struct elf64_phdr *)(elf_data + ehdr->e_phoff);
++
++	/* go through the available ELF segments */
++	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++		u64 da = phdr->p_paddr;
++		u64 memsz = phdr->p_memsz;
++		u64 filesz = phdr->p_filesz;
++		u64 offset = phdr->p_offset;
++		void *ptr;
++
++		if (phdr->p_type != PT_LOAD)
++			continue;
++
++		dev_dbg(dev, "phdr: type %d da 0x%x memsz 0x%x filesz 0x%x\n",
++			phdr->p_type, da, memsz, filesz);
++
++		if (filesz > memsz) {
++			dev_err(dev, "bad phdr filesz 0x%x memsz 0x%x\n",
++				filesz, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (offset + filesz > fw->size) {
++			dev_err(dev, "truncated fw: need 0x%x avail 0x%zx\n",
++				offset + filesz, fw->size);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* grab the kernel address for this device address */
++		ptr = rproc_da_to_va(rproc, da, memsz);
++		if (!ptr) {
++			dev_err(dev, "bad phdr da 0x%x mem 0x%x\n", da, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* put the segment where the remote processor expects it */
++		if (phdr->p_filesz)
++			memcpy(ptr, elf_data + phdr->p_offset, filesz);
++
++		/*
++		 * Zero out remaining memory for this segment.
++		 *
++		 * This isn't strictly required since dma_alloc_coherent already
++		 * did this for us. albeit harmless, we may consider removing
++		 * this.
++		 */
++		if (memsz > filesz)
++			memset(ptr + filesz, 0, memsz - filesz);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(rproc_elf64_load_segments);
++
++static struct elf64_shdr *
++find_table_64(struct device *dev, struct elf64_hdr *ehdr, size_t fw_size)
++{
++	struct elf64_shdr *shdr;
++	int i;
++	const char *name_table;
++	struct resource_table *table = NULL;
++	const u8 *elf_data = (void *)ehdr;
++
++	/* look for the resource table and handle it */
++	shdr = (struct elf64_shdr *)(elf_data + ehdr->e_shoff);
++	name_table = elf_data + shdr[ehdr->e_shstrndx].sh_offset;
++
++	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
++		u64 size = shdr->sh_size;
++		u64 offset = shdr->sh_offset;
++
++		if (strcmp(name_table + shdr->sh_name, ".resource_table"))
++			continue;
++
++		table = (struct resource_table *)(elf_data + offset);
++
++		/* make sure we have the entire table */
++		if (offset + size > fw_size || offset + size < size) {
++			dev_err(dev, "resource table truncated\n");
++			return NULL;
++		}
++
++		/* make sure table has at least the header */
++		if (sizeof(struct resource_table) > size) {
++			dev_err(dev, "header-less resource table\n");
++			return NULL;
++		}
++
++		/* we don't support any version beyond the first */
++		if (table->ver != 1) {
++			dev_err(dev, "unsupported fw ver: %d\n", table->ver);
++			return NULL;
++		}
++
++		/* make sure reserved bytes are zeroes */
++		if (table->reserved[0] || table->reserved[1]) {
++			dev_err(dev, "non zero reserved bytes\n");
++			return NULL;
++		}
++
++		/* make sure the offsets array isn't truncated */
++		if (table->num * sizeof(table->offset[0]) +
++				sizeof(struct resource_table) > size) {
++			dev_err(dev, "resource table incomplete\n");
++			return NULL;
++		}
++
++		return shdr;
++	}
++
++	return NULL;
++}
++
++/**
++ * rproc_elf64_load_rsc_table() - load the resource table
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ *
++ * This function finds the resource table inside the remote processor's
++ * firmware, load it into the @cached_table and update @table_ptr.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int rproc_elf64_load_rsc_table(struct rproc *rproc, const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr;
++	struct elf64_shdr *shdr;
++	struct device *dev = &rproc->dev;
++	struct resource_table *table = NULL;
++	const u8 *elf_data = fw->data;
++	size_t tablesz;
++
++	ehdr = (struct elf64_hdr *)elf_data;
++
++	shdr = find_table_64(dev, ehdr, fw->size);
++	if (!shdr)
++		return -EINVAL;
++
++	table = (struct resource_table *)(elf_data + shdr->sh_offset);
++	tablesz = shdr->sh_size;
++
++	/*
++	 * Create a copy of the resource table. When a virtio device starts
++	 * and calls vring_new_virtqueue() the address of the allocated vring
++	 * will be stored in the cached_table. Before the device is started,
++	 * cached_table will be copied into device memory.
++	 */
++	rproc->cached_table = kmemdup(table, tablesz, GFP_KERNEL);
++	if (!rproc->cached_table)
++		return -ENOMEM;
++
++	rproc->table_ptr = rproc->cached_table;
++	rproc->table_sz = tablesz;
++
++	return 0;
++}
++EXPORT_SYMBOL(rproc_elf64_load_rsc_table);
++
++/**
++ * rproc_elf64_find_loaded_rsc_table() - find the loaded resource table
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ *
++ * This function finds the location of the loaded resource table. Don't
++ * call this function if the table wasn't loaded yet - it's a bug if you do.
++ *
++ * Returns the pointer to the resource table if it is found or NULL otherwise.
++ * If the table wasn't loaded yet the result is unspecified.
++ */
++struct resource_table *rproc_elf64_find_loaded_rsc_table(struct rproc *rproc,
++						       const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr = (struct elf64_hdr *)fw->data;
++	struct elf64_shdr *shdr;
++
++	shdr = find_table_64(&rproc->dev, ehdr, fw->size);
++	if (!shdr)
++		return NULL;
++
++	return rproc_da_to_va(rproc, shdr->sh_addr, shdr->sh_size);
++}
++EXPORT_SYMBOL(rproc_elf64_find_loaded_rsc_table);
++
++/**
++ * rproc_elf64_get_chksum() - calcuate checksum of the loadable section
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ * @algo: name of the checksum algorithm
++ * @chksum: checksum
++ * @output_size: size of the checksum
++ *
++ * This function calculate the checksum of the loadable secitons
++ * of the specified firmware.
++ *
++ * Returns 0 for success, negative value for failure.
++ */
++int rproc_elf64_get_chksum(struct rproc *rproc, const struct firmware *fw,
++		char *algo, u8 *chksum, int output_size)
++{
++	int ret, i;
++	struct device *dev = &rproc->dev;
++	struct crypto_shash *tfm;
++	struct shash_desc *desc;
++	int algo_len = 0;
++	struct elf64_hdr *ehdr;
++	struct elf64_phdr *phdr;
++	const u8 *elf_data = fw->data;
++
++	memset(chksum, 0, output_size);
++	/* If no algo is specified, default it to "sha256" */
++	if (!strlen(algo))
++		sprintf(algo, "sha256");
++	ret = crypto_has_alg(algo, 0, 0);
++	if (!ret) {
++		dev_err(dev, "failed to find crypto algo: %s.\n", algo);
++		return -EINVAL;
++	}
++	dev_dbg(dev, "firmware checksum algo: %s.\n", algo);
++	tfm =  crypto_alloc_shash(algo, 0, 0);
++	if (!tfm) {
++		dev_err(dev, "failed to allocate shash.\n");
++		return -ENOMEM;
++	}
++	algo_len = crypto_shash_digestsize(tfm);
++	if (algo_len > output_size) {
++		dev_err(dev,
++			"algo digest size %d is larger expected %d.\n",
++			algo_len, output_size);
++		return -EINVAL;
++	}
++	desc = kzalloc(sizeof(*desc) + algo_len, GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++	desc->tfm = tfm;
++	ret = crypto_shash_init(desc);
++	if (ret) {
++		dev_err(dev, "failed crypto %s initialization.\n", algo);
++		return ret;
++	}
++
++	ehdr = (struct elf64_hdr *)elf_data;
++	phdr = (struct elf64_phdr *)(elf_data + ehdr->e_phoff);
++
++	/* go through the available ELF segments */
++	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++		u64 memsz = phdr->p_memsz;
++		u64 filesz = phdr->p_filesz;
++		u64 offset = phdr->p_offset;
++
++		if (phdr->p_type != PT_LOAD)
++			continue;
++
++		if (filesz > memsz) {
++			dev_err(dev, "bad phdr filesz 0x%x memsz 0x%x\n",
++				filesz, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (offset + filesz > fw->size) {
++			dev_err(dev, "truncated fw: need 0x%x avail 0x%zx\n",
++				offset + filesz, fw->size);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* put the segment where the remote processor expects it */
++		if (phdr->p_filesz) {
++			ret = crypto_shash_update(desc,
++				elf_data + offset, filesz);
++			if (ret) {
++				dev_err(dev,
++				"Failed to update fw crypto digest state at offset 0x%x, size 0x%x.\n",
++				offset, filesz);
++				return ret;
++			}
++		}
++
++	}
++	ret = crypto_shash_final(desc, chksum);
++	crypto_free_shash(tfm);
++	kfree(desc);
++	if (ret) {
++		dev_err(dev, "failed to finalize checksum of firmware.\n");
++		return ret;
++	}
++	return ret;
++}
++EXPORT_SYMBOL(rproc_elf64_get_chksum);
+diff --git a/drivers/remoteproc/remoteproc_elf_loader.c b/drivers/remoteproc/remoteproc_elf_loader.c
+index df7fd7f780ec..09168630cca1 100644
+--- a/drivers/remoteproc/remoteproc_elf_loader.c
++++ b/drivers/remoteproc/remoteproc_elf_loader.c
+@@ -111,11 +111,11 @@ EXPORT_SYMBOL(rproc_elf_sanity_check);
+  * Note that the boot address is not a configurable property of all remote
+  * processors. Some will always boot at a specific hard-coded address.
+  */
+-u32 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
++u64 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
+ {
+ 	struct elf32_hdr *ehdr  = (struct elf32_hdr *)fw->data;
+ 
+-	return ehdr->e_entry;
++	return (u64)(ehdr->e_entry);
+ }
+ EXPORT_SYMBOL(rproc_elf_get_boot_addr);
+ 
+@@ -151,6 +151,7 @@ int rproc_elf_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 	int i, ret = 0;
+ 	const u8 *elf_data = fw->data;
+ 
++	pr_warn("%s(%d): loading elf images!\n", __FILE__, __LINE__);
+ 	ehdr = (struct elf32_hdr *)elf_data;
+ 	phdr = (struct elf32_phdr *)(elf_data + ehdr->e_phoff);
+ 
+@@ -444,3 +445,416 @@ int rproc_elf_get_chksum(struct rproc *rproc, const struct firmware *fw,
+ 	return ret;
+ }
+ EXPORT_SYMBOL(rproc_elf_get_chksum);
++
++/**
++ * rproc_elf64_sanity_check() - Sanity Check ELF firmware image
++ * @rproc: the remote processor handle
++ * @fw: the ELF firmware image
++ *
++ * Make sure this fw image is sane.
++ */
++int rproc_elf64_sanity_check(struct rproc *rproc, const struct firmware *fw)
++{
++	const char *name = rproc->firmware;
++	struct device *dev = &rproc->dev;
++	struct elf64_hdr *ehdr;
++	char class;
++
++	if (!fw) {
++		dev_err(dev, "failed to load %s\n", name);
++		return -EINVAL;
++	}
++
++	if (fw->size < sizeof(struct elf64_hdr)) {
++		dev_err(dev, "Image is too small\n");
++		return -EINVAL;
++	}
++
++	ehdr = (struct elf64_hdr *)fw->data;
++
++	/* We only support elf32 and elf64 at this point */
++	class = ehdr->e_ident[EI_CLASS];
++	if (class != ELFCLASS32 && class != ELFCLASS64) {
++		dev_err(dev, "Unsupported class: %d\n", class);
++		return -EINVAL;
++	}
++
++	/* We assume the firmware has the same endianness as the host */
++# ifdef __LITTLE_ENDIAN
++	if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
++# else /* BIG ENDIAN */
++	if (ehdr->e_ident[EI_DATA] != ELFDATA2MSB) {
++# endif
++		dev_err(dev, "Unsupported firmware endianness\n");
++		return -EINVAL;
++	}
++
++	if (fw->size < ehdr->e_shoff + sizeof(struct elf64_shdr)) {
++		dev_err(dev, "Image is too small\n");
++		return -EINVAL;
++	}
++
++	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG)) {
++		dev_err(dev, "Image is corrupted (bad magic)\n");
++		return -EINVAL;
++	}
++
++	if (ehdr->e_phnum == 0) {
++		dev_err(dev, "No loadable segments\n");
++		return -EINVAL;
++	}
++
++	if (ehdr->e_phoff > fw->size) {
++		dev_err(dev, "Firmware size is too small\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(rproc_elf64_sanity_check);
++
++/**
++ * rproc_elf64_get_boot_addr() - Get rproc's boot address.
++ * @rproc: the remote processor handle
++ * @fw: the ELF firmware image
++ *
++ * This function returns the entry point address of the ELF
++ * image.
++ *
++ * Note that the boot address is not a configurable property of all remote
++ * processors. Some will always boot at a specific hard-coded address.
++ */
++u64 rproc_elf64_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr  = (struct elf64_hdr *)fw->data;
++
++	return ehdr->e_entry;
++}
++EXPORT_SYMBOL(rproc_elf64_get_boot_addr);
++
++/**
++ * rproc_elf64_load_segments() - load firmware segments to memory
++ * @rproc: remote processor which will be booted using these fw segments
++ * @fw: the ELF firmware image
++ *
++ * This function loads the firmware segments to memory, where the remote
++ * processor expects them.
++ *
++ * Some remote processors will expect their code and data to be placed
++ * in specific device addresses, and can't have them dynamically assigned.
++ *
++ * We currently support only those kind of remote processors, and expect
++ * the program header's paddr member to contain those addresses. We then go
++ * through the physically contiguous "carveout" memory regions which we
++ * allocated (and mapped) earlier on behalf of the remote processor,
++ * and "translate" device address to kernel addresses, so we can copy the
++ * segments where they are expected.
++ *
++ * Currently we only support remote processors that required carveout
++ * allocations and got them mapped onto their iommus. Some processors
++ * might be different: they might not have iommus, and would prefer to
++ * directly allocate memory for every segment/resource. This is not yet
++ * supported, though.
++ */
++int rproc_elf64_load_segments(struct rproc *rproc, const struct firmware *fw)
++{
++	struct device *dev = &rproc->dev;
++	struct elf64_hdr *ehdr;
++	struct elf64_phdr *phdr;
++	int i, ret = 0;
++	const u8 *elf_data = fw->data;
++
++	pr_warn("%s(%d): loading elf images!\n", __FILE__, __LINE__);
++	ehdr = (struct elf64_hdr *)elf_data;
++	phdr = (struct elf64_phdr *)(elf_data + ehdr->e_phoff);
++
++	/* go through the available ELF segments */
++	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++		u64 da = phdr->p_paddr;
++		u64 memsz = phdr->p_memsz;
++		u64 filesz = phdr->p_filesz;
++		u64 offset = phdr->p_offset;
++		void *ptr;
++
++		if (phdr->p_type != PT_LOAD)
++			continue;
++
++		dev_dbg(dev, "phdr: type %d da 0x%llx memsz 0x%llx filesz 0x%llx\n",
++			phdr->p_type, da, memsz, filesz);
++
++		if (filesz > memsz) {
++			dev_err(dev, "bad phdr filesz 0x%llx memsz 0x%llx\n",
++				filesz, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (offset + filesz > fw->size) {
++			dev_err(dev, "truncated fw: need 0x%llx avail 0x%zx\n",
++				offset + filesz, fw->size);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* grab the kernel address for this device address */
++		ptr = rproc_da_to_va(rproc, da, memsz);
++		if (!ptr) {
++			dev_err(dev, "bad phdr da 0x%llx mem 0x%llx\n", da, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* put the segment where the remote processor expects it */
++		if (phdr->p_filesz)
++			memcpy(ptr, elf_data + phdr->p_offset, filesz);
++
++		/*
++		 * Zero out remaining memory for this segment.
++		 *
++		 * This isn't strictly required since dma_alloc_coherent already
++		 * did this for us. albeit harmless, we may consider removing
++		 * this.
++		 */
++		if (memsz > filesz)
++			memset(ptr + filesz, 0, memsz - filesz);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(rproc_elf64_load_segments);
++
++static struct elf64_shdr *
++find_table_64(struct device *dev, struct elf64_hdr *ehdr, size_t fw_size)
++{
++	struct elf64_shdr *shdr;
++	int i;
++	const char *name_table;
++	struct resource_table *table = NULL;
++	const u8 *elf_data = (void *)ehdr;
++
++	/* look for the resource table and handle it */
++	shdr = (struct elf64_shdr *)(elf_data + ehdr->e_shoff);
++	name_table = elf_data + shdr[ehdr->e_shstrndx].sh_offset;
++
++	for (i = 0; i < ehdr->e_shnum; i++, shdr++) {
++		u64 size = shdr->sh_size;
++		u64 offset = shdr->sh_offset;
++
++		if (strcmp(name_table + shdr->sh_name, ".resource_table"))
++			continue;
++
++		table = (struct resource_table *)(elf_data + offset);
++
++		/* make sure we have the entire table */
++		if (offset + size > fw_size || offset + size < size) {
++			dev_err(dev, "resource table truncated\n");
++			return NULL;
++		}
++
++		/* make sure table has at least the header */
++		if (sizeof(struct resource_table) > size) {
++			dev_err(dev, "header-less resource table\n");
++			return NULL;
++		}
++
++		/* we don't support any version beyond the first */
++		if (table->ver != 1) {
++			dev_err(dev, "unsupported fw ver: %d\n", table->ver);
++			return NULL;
++		}
++
++		/* make sure reserved bytes are zeroes */
++		if (table->reserved[0] || table->reserved[1]) {
++			dev_err(dev, "non zero reserved bytes\n");
++			return NULL;
++		}
++
++		/* make sure the offsets array isn't truncated */
++		if (table->num * sizeof(table->offset[0]) +
++				sizeof(struct resource_table) > size) {
++			dev_err(dev, "resource table incomplete\n");
++			return NULL;
++		}
++
++		return shdr;
++	}
++
++	return NULL;
++}
++
++/**
++ * rproc_elf64_load_rsc_table() - load the resource table
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ *
++ * This function finds the resource table inside the remote processor's
++ * firmware, load it into the @cached_table and update @table_ptr.
++ *
++ * Return: 0 on success, negative errno on failure.
++ */
++int rproc_elf64_load_rsc_table(struct rproc *rproc, const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr;
++	struct elf64_shdr *shdr;
++	struct device *dev = &rproc->dev;
++	struct resource_table *table = NULL;
++	const u8 *elf_data = fw->data;
++	size_t tablesz;
++
++	ehdr = (struct elf64_hdr *)elf_data;
++
++	shdr = find_table_64(dev, ehdr, fw->size);
++	if (!shdr)
++		return -EINVAL;
++
++	table = (struct resource_table *)(elf_data + shdr->sh_offset);
++	tablesz = shdr->sh_size;
++
++	/*
++	 * Create a copy of the resource table. When a virtio device starts
++	 * and calls vring_new_virtqueue() the address of the allocated vring
++	 * will be stored in the cached_table. Before the device is started,
++	 * cached_table will be copied into device memory.
++	 */
++	rproc->cached_table = kmemdup(table, tablesz, GFP_KERNEL);
++	if (!rproc->cached_table)
++		return -ENOMEM;
++
++	rproc->table_ptr = rproc->cached_table;
++	rproc->table_sz = tablesz;
++
++	return 0;
++}
++EXPORT_SYMBOL(rproc_elf64_load_rsc_table);
++
++/**
++ * rproc_elf64_find_loaded_rsc_table() - find the loaded resource table
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ *
++ * This function finds the location of the loaded resource table. Don't
++ * call this function if the table wasn't loaded yet - it's a bug if you do.
++ *
++ * Returns the pointer to the resource table if it is found or NULL otherwise.
++ * If the table wasn't loaded yet the result is unspecified.
++ */
++struct resource_table *rproc_elf64_find_loaded_rsc_table(struct rproc *rproc,
++						       const struct firmware *fw)
++{
++	struct elf64_hdr *ehdr = (struct elf64_hdr *)fw->data;
++	struct elf64_shdr *shdr;
++
++	shdr = find_table_64(&rproc->dev, ehdr, fw->size);
++	if (!shdr)
++		return NULL;
++
++	return rproc_da_to_va(rproc, shdr->sh_addr, shdr->sh_size);
++}
++EXPORT_SYMBOL(rproc_elf64_find_loaded_rsc_table);
++
++/**
++ * rproc_elf64_get_chksum() - calcuate checksum of the loadable section
++ * @rproc: the rproc handle
++ * @fw: the ELF firmware image
++ * @algo: name of the checksum algorithm
++ * @chksum: checksum
++ * @output_size: size of the checksum
++ *
++ * This function calculate the checksum of the loadable secitons
++ * of the specified firmware.
++ *
++ * Returns 0 for success, negative value for failure.
++ */
++int rproc_elf64_get_chksum(struct rproc *rproc, const struct firmware *fw,
++		char *algo, u8 *chksum, int output_size)
++{
++	int ret, i;
++	struct device *dev = &rproc->dev;
++	struct crypto_shash *tfm;
++	struct shash_desc *desc;
++	int algo_len = 0;
++	struct elf64_hdr *ehdr;
++	struct elf64_phdr *phdr;
++	const u8 *elf_data = fw->data;
++
++	memset(chksum, 0, output_size);
++	/* If no algo is specified, default it to "sha256" */
++	if (!strlen(algo))
++		sprintf(algo, "sha256");
++	ret = crypto_has_alg(algo, 0, 0);
++	if (!ret) {
++		dev_err(dev, "failed to find crypto algo: %s.\n", algo);
++		return -EINVAL;
++	}
++	dev_dbg(dev, "firmware checksum algo: %s.\n", algo);
++	tfm =  crypto_alloc_shash(algo, 0, 0);
++	if (!tfm) {
++		dev_err(dev, "failed to allocate shash.\n");
++		return -ENOMEM;
++	}
++	algo_len = crypto_shash_digestsize(tfm);
++	if (algo_len > output_size) {
++		dev_err(dev,
++			"algo digest size %d is larger expected %d.\n",
++			algo_len, output_size);
++		return -EINVAL;
++	}
++	desc = kzalloc(sizeof(*desc) + algo_len, GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++	desc->tfm = tfm;
++	ret = crypto_shash_init(desc);
++	if (ret) {
++		dev_err(dev, "failed crypto %s initialization.\n", algo);
++		return ret;
++	}
++
++	ehdr = (struct elf64_hdr *)elf_data;
++	phdr = (struct elf64_phdr *)(elf_data + ehdr->e_phoff);
++
++	/* go through the available ELF segments */
++	for (i = 0; i < ehdr->e_phnum; i++, phdr++) {
++		u64 memsz = phdr->p_memsz;
++		u64 filesz = phdr->p_filesz;
++		u64 offset = phdr->p_offset;
++
++		if (phdr->p_type != PT_LOAD)
++			continue;
++
++		if (filesz > memsz) {
++			dev_err(dev, "bad phdr filesz 0x%llx memsz 0x%llx\n",
++				filesz, memsz);
++			ret = -EINVAL;
++			break;
++		}
++
++		if (offset + filesz > fw->size) {
++			dev_err(dev, "truncated fw: need 0x%llx avail 0x%zx\n",
++				offset + filesz, fw->size);
++			ret = -EINVAL;
++			break;
++		}
++
++		/* put the segment where the remote processor expects it */
++		if (phdr->p_filesz) {
++			ret = crypto_shash_update(desc,
++				elf_data + offset, filesz);
++			if (ret) {
++				dev_err(dev,
++				"Failed to update fw crypto digest state at offset 0x%llx, size 0x%llx.\n",
++				offset, filesz);
++				return ret;
++			}
++		}
++
++	}
++	ret = crypto_shash_final(desc, chksum);
++	crypto_free_shash(tfm);
++	kfree(desc);
++	if (ret) {
++		dev_err(dev, "failed to finalize checksum of firmware.\n");
++		return ret;
++	}
++	return ret;
++}
++EXPORT_SYMBOL(rproc_elf64_get_chksum);
+diff --git a/drivers/remoteproc/remoteproc_internal.h b/drivers/remoteproc/remoteproc_internal.h
+index 678f4c0361c1..61f3d32fa650 100644
+--- a/drivers/remoteproc/remoteproc_internal.h
++++ b/drivers/remoteproc/remoteproc_internal.h
+@@ -84,7 +84,7 @@ void *rproc_da_to_va(struct rproc *rproc, u64 da, int len);
+ int rproc_trigger_recovery(struct rproc *rproc);
+ 
+ int rproc_elf_sanity_check(struct rproc *rproc, const struct firmware *fw);
+-u32 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw);
++u64 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw);
+ int rproc_elf_load_segments(struct rproc *rproc, const struct firmware *fw);
+ int rproc_elf_load_rsc_table(struct rproc *rproc, const struct firmware *fw);
+ struct resource_table *rproc_elf_find_loaded_rsc_table(struct rproc *rproc,
+@@ -92,6 +92,14 @@ struct resource_table *rproc_elf_find_loaded_rsc_table(struct rproc *rproc,
+ int rproc_elf_get_chksum(struct rproc *rproc, const struct firmware *fw,
+ 		char *algo, u8 *chksum, int output_size);
+ 
++int rproc_elf64_sanity_check(struct rproc *rproc, const struct firmware *fw);
++u64 rproc_elf64_get_boot_addr(struct rproc *rproc, const struct firmware *fw);
++int rproc_elf64_load_segments(struct rproc *rproc, const struct firmware *fw);
++int rproc_elf64_load_rsc_table(struct rproc *rproc, const struct firmware *fw);
++struct resource_table *rproc_elf64_find_loaded_rsc_table(struct rproc *rproc,
++						       const struct firmware *fw);
++int rproc_elf64_get_chksum(struct rproc *rproc, const struct firmware *fw,
++		char *algo, u8 *chksum, int output_size);
+ static inline
+ int rproc_fw_sanity_check(struct rproc *rproc, const struct firmware *fw)
+ {
+@@ -102,7 +110,7 @@ int rproc_fw_sanity_check(struct rproc *rproc, const struct firmware *fw)
+ }
+ 
+ static inline
+-u32 rproc_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
++u64 rproc_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
+ {
+ 	if (rproc->ops->get_boot_addr)
+ 		return rproc->ops->get_boot_addr(rproc, fw);
+diff --git a/drivers/remoteproc/zynqmp_a53_remoteproc.c b/drivers/remoteproc/zynqmp_a53_remoteproc.c
+index ce4a3ac0cc6d..94842ebb6233 100644
+--- a/drivers/remoteproc/zynqmp_a53_remoteproc.c
++++ b/drivers/remoteproc/zynqmp_a53_remoteproc.c
+@@ -479,6 +479,13 @@ static struct rproc_ops zynqmp_a53_rproc_ops = {
+ 	.is_running     = zynqmp_a53_rproc_is_running,
+ 	.kick		= zynqmp_a53_rproc_kick,
+ 	.da_to_va       = zynqmp_a53_rproc_da_to_va,
++	.load		= rproc_elf64_load_segments,
++	.parse_fw	= rproc_elf64_load_rsc_table,
++	.find_loaded_rsc_table	= rproc_elf64_find_loaded_rsc_table,
++	.sanity_check	= rproc_elf64_sanity_check,
++	.get_chksum	= rproc_elf64_get_chksum,
++	.get_boot_addr	= rproc_elf64_get_boot_addr,
++	
+ };
+ 
+ static int zynqmp_a53_rproc_add_mems(struct zynqmp_a53_rproc_pdata *pdata)
+@@ -828,7 +835,7 @@ static int zynqmp_a53_remoteproc_remove(struct platform_device *pdev)
+ 
+ /* Match table for OF platform binding */
+ static const struct of_device_id zynqmp_a53_remoteproc_match[] = {
+-	{ .compatible = "xlnx,zynqmp-a53-remoteproc-1.0", },
++	{ .compatible = "xlnx,zynqmp-r5-remoteproc-1.0", },
+ 	{ /* end of list */ },
+ };
+ MODULE_DEVICE_TABLE(of, zynqmp_a53_remoteproc_match);
+diff --git a/include/linux/remoteproc.h b/include/linux/remoteproc.h
+index eb9659dd2634..abd0d62a1247 100644
+--- a/include/linux/remoteproc.h
++++ b/include/linux/remoteproc.h
+@@ -387,7 +387,7 @@ struct rproc_ops {
+ 				struct rproc *rproc, const struct firmware *fw);
+ 	int (*load)(struct rproc *rproc, const struct firmware *fw);
+ 	int (*sanity_check)(struct rproc *rproc, const struct firmware *fw);
+-	u32 (*get_boot_addr)(struct rproc *rproc, const struct firmware *fw);
++	u64 (*get_boot_addr)(struct rproc *rproc, const struct firmware *fw);
+ 	bool (*is_running)(struct rproc *rproc);
+ 	int (*get_chksum)(struct rproc *rproc, const struct firmware *fw,
+ 			char *algo, u8 *chksum, int output_size);
+@@ -499,7 +499,7 @@ struct rproc {
+ 	int num_traces;
+ 	struct list_head carveouts;
+ 	struct list_head mappings;
+-	u32 bootaddr;
++	u64 bootaddr;
+ 	struct list_head rvdevs;
+ 	struct list_head subdevs;
+ 	struct idr notifyids;
+-- 
+2.13.3
+

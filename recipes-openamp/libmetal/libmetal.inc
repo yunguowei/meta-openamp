@@ -30,7 +30,7 @@ LIBMETAL_MACHINE ?= "${@get_cmake_machine(d.getVar('TARGET_OS'), d.getVar('TUNE_
 EXTRA_OECMAKE = " \
 	-DLIB_INSTALL_DIR=${libdir} \
 	-DLIBEXEC_INSTALL_DIR=${libexecdir} \
-	-DMACHINE=${LIBMETAL_MACHINE} \
+	-DMACHINE=zynqmp_a53 \
 	-DWITH_EXAMPLES=ON \
 	"
 ALLOW_EMPTY_${PN}-demos = "1"

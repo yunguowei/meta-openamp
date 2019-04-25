@@ -1,0 +1,790 @@
+From fe2d9ce02c9ab1128815af88bdf5d130ce77da69 Mon Sep 17 00:00:00 2001
+From: Yunguo Wei <yunguo.wei@windriver.com>
+Date: Tue, 12 Mar 2019 02:12:57 +0000
+Subject: [PATCH 5/6] adding AMP_LOADER
+
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ drivers/Kconfig                |   2 +
+ drivers/Makefile               |   1 +
+ drivers/amploader/Kconfig      |   4 +
+ drivers/amploader/Makefile     |   1 +
+ drivers/amploader/amp_loader.c | 725 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 733 insertions(+)
+ create mode 100644 drivers/amploader/Kconfig
+ create mode 100644 drivers/amploader/Makefile
+ create mode 100644 drivers/amploader/amp_loader.c
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 95b9ccc08165..22fe328e01a3 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0
+ menu "Device Drivers"
+ 
++source "drivers/amploader/Kconfig"
++
+ source "drivers/amba/Kconfig"
+ 
+ source "drivers/base/Kconfig"
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 24cd47014657..21cb348f799b 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -185,3 +185,4 @@ obj-$(CONFIG_TEE)		+= tee/
+ obj-$(CONFIG_MULTIPLEXER)	+= mux/
+ obj-$(CONFIG_UNISYS_VISORBUS)	+= visorbus/
+ obj-$(CONFIG_SIOX)		+= siox/
++obj-$(CONFIG_AMP_LOADER)        += amploader/
+diff --git a/drivers/amploader/Kconfig b/drivers/amploader/Kconfig
+new file mode 100644
+index 000000000000..a309b0c3a02f
+--- /dev/null
++++ b/drivers/amploader/Kconfig
+@@ -0,0 +1,4 @@
++config AMP_LOADER
++	tristate "A loader to boot amp system on secondary cores"
++	help
++	  This is a loader to boot amp system on secondary cores
+diff --git a/drivers/amploader/Makefile b/drivers/amploader/Makefile
+new file mode 100644
+index 000000000000..7c429cb239a1
+--- /dev/null
++++ b/drivers/amploader/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_AMP_LOADER)		:= amp_loader.o
+diff --git a/drivers/amploader/amp_loader.c b/drivers/amploader/amp_loader.c
+new file mode 100644
+index 000000000000..b9a80775ab50
+--- /dev/null
++++ b/drivers/amploader/amp_loader.c
+@@ -0,0 +1,725 @@
++/*
++ * create a file in /proc
++ * playing around with the proc filesystem
++ * 
++ * 
++ */
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/kernel.h>
++#include <linux/seq_file.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
++#include <asm/io.h>
++#include <asm/cputype.h>
++#include <asm/pgtable.h>
++
++#if 1
++#define DEBUG 1
++#endif
++
++//extern int amp_boot(unsigned int cpu, phys_addr_t);
++static struct proc_dir_entry *amp_dir;
++
++/* arch dependent definitions */
++#define TTBR_SEL_SHIFT		16
++#define MMU_BLOCK_SHIFT		30
++#define MMU_BLOCK_SIZE		(1 << 30)
++#define MMU_BLOCK_MASK		(~(MMU_BLOCK_SIZE - 1))
++#define VA_SIZE			(_AC(1, UL) << VA_BITS)
++#define VA_MASK			(VA_SIZE - 1)
++#define PER_L1_TABLE_SIZE	(PAGE_SIZE)
++
++#define MEM_ZERO_PHYS_ADDR	0x80000000
++#define MEM_ZERO_VIRT_ADDR	0x80000000
++#define MEM_2G_PHYS_ADDR	0x880000000
++
++#define PROT_ATTR	(PROT_DEFAULT | PTE_ATTRINDX(MT_DEVICE_nGnRnE))
++
++#define L0_L1_OFFSET			0x01000000
++#define TTBR0_TTBR1_OFFSET		0x02000000
++#define SECONDARY_INIT_TTBR0_L0_BASE	0xd0000000
++#define SECONDARY_INIT_TTBR0_L1_BASE	(SECONDARY_INIT_TTBR0_L0_BASE + L0_L1_OFFSET)
++#define SECONDARY_INIT_TTBR1_L0_BASE	(SECONDARY_INIT_TTBR0_L0_BASE + TTBR0_TTBR1_OFFSET)
++#define SECONDARY_INIT_TTBR1_L1_BASE	(SECONDARY_INIT_TTBR1_L0_BASE + L0_L1_OFFSET)
++
++#ifdef DEBUG
++//static phys_addr_t amp_phy_addr = 0x21c0000;
++//static phys_addr_t amp_addr = 0;
++static phys_addr_t amp_virt_addr = 0;
++static size_t amp_size = 0x1000000;
++static phys_addr_t ioremap_phys_addr = 0;
++static phys_addr_t ioremap_virt_addr = 0;
++static size_t ioremap_length = 0;
++#endif
++static phys_addr_t amp_secondary_start_virt_addr = 0;
++static phys_addr_t amp_secondary_start_virt_base = 0;
++static size_t amp_binary_size = 0;
++static phys_addr_t ioremap_ttbr0_l0_virt_addr = 0; /* L0 table virt base for ttbr0 */
++static phys_addr_t ioremap_ttbr1_l0_virt_addr = 0; /* L0 table phys base addr for ttbr1 */
++static phys_addr_t secondary_start_virt_addr;
++static phys_addr_t secondary_start_phys_addr;
++
++#define ioremap_ttbr0_l1_virt_addr (ioremap_ttbr0_l0_virt_addr + L0_L1_OFFSET)
++#define ioremap_ttbr1_l1_virt_addr (ioremap_ttbr1_l0_virt_addr + L0_L1_OFFSET)
++
++int setup_secondary_addr(void );
++//int setup_secondary_mmu_table(void);
++#if 0
++/*phys and virt addr should be 48-bit addr ARM64_VA_BITS */
++int setup_block_entry(phys_addr_t virt_addr, phys_addr_t phys_addr, int ttbr)
++{
++	/* l0 table entry is same as page table entry, so we use PTE ops */
++	pte_t pte_val = __pte(0);
++	pte_t *pte = 0;
++	phys_addr_t virt_addr_valid = virt_addr & VA_MASK;
++	phys_addr_t l0_table_base_virt_addr = 0;
++	phys_addr_t l1_tables_base_virt_addr = 0;
++	phys_addr_t l1_tables_base_phys_addr = 0;
++	phys_addr_t l1_table_base_phys_addr = 0;
++	phys_addr_t l1_table_base_virt_addr = 0;
++	pud_t pud_val = __pud(0);
++	pud_t *pud = 0;
++
++	if(ttbr == 0) {
++		printk(KERN_INFO "Setting up TTBR0 entry!\n");
++		l0_table_base_virt_addr = ioremap_ttbr0_l0_virt_addr;
++		l1_tables_base_phys_addr = SECONDARY_INIT_TTBR0_L1_BASE;
++		l1_tables_base_virt_addr = ioremap_ttbr0_l1_virt_addr; 
++	} else if(ttbr == 1) {
++		printk(KERN_INFO "Setting up TTBR1 entry!\n");
++		l0_table_base_virt_addr = ioremap_ttbr1_l0_virt_addr;
++		l1_tables_base_phys_addr = SECONDARY_INIT_TTBR1_L1_BASE;
++		l1_tables_base_virt_addr = ioremap_ttbr1_l1_virt_addr; 
++	} else 
++		return 1;
++
++	if(!l0_table_base_virt_addr) {
++		printk(KERN_INFO "Error! L0 table base is not init.\n");
++		return 1;
++	}
++
++	/* retrieve L1 table addr */
++	l1_table_base_phys_addr = l1_tables_base_phys_addr + \
++			PER_L1_TABLE_SIZE * pgd_index(virt_addr_valid);
++	l1_table_base_virt_addr = l1_tables_base_virt_addr + \
++			PER_L1_TABLE_SIZE * pgd_index(virt_addr_valid);
++
++	pte_val = pfn_pte((l1_table_base_phys_addr) >> PAGE_SHIFT, \
++			__pgprot(PROT_ATTR));
++	pte = (pte_t *)l0_table_base_virt_addr + pgd_index(virt_addr_valid);
++
++	printk(KERN_INFO "Setting L0 table entry! \n");
++	printk(KERN_INFO "L0 entry@0x%p, value: 0x%llx \n", pte, pte_val.pte);
++
++	*pte = pte_val;
++
++	pud = (pud_t *)l1_table_base_virt_addr + pud_index(virt_addr_valid);
++	pud_val = __pud(phys_addr | PUD_TYPE_SECT | \
++			pgprot_val(mk_sect_prot(__pgprot(PROT_ATTR)))); 
++
++	printk(KERN_INFO "Setting L1 table entry!");
++	printk(KERN_INFO "L1 entry@0x%p, value: 0x%llx \n", pud, pud_val.pud);
++
++	set_pud(pud, pud_val);
++	return 0;
++}
++
++int setup_secondary_mmu_table(void)
++{
++	phys_addr_t secondary_start_virt_base = 0;
++	
++	if( !secondary_start_phys_addr || !secondary_start_virt_addr) {
++		printk(KERN_ERR "Abort, runtime phys addr is not specified.");
++		return 1;
++	}
++
++	secondary_start_virt_base = (secondary_start_virt_addr >> MMU_BLOCK_SHIFT) \
++			<< MMU_BLOCK_SHIFT << TTBR_SEL_SHIFT >> TTBR_SEL_SHIFT; 
++	
++	ioremap_ttbr0_l0_virt_addr = (phys_addr_t)ioremap(SECONDARY_INIT_TTBR0_L0_BASE, (TTBR0_TTBR1_OFFSET * 2));
++	ioremap_ttbr1_l0_virt_addr = ioremap_ttbr0_l0_virt_addr + TTBR0_TTBR1_OFFSET;
++
++	printk(KERN_DEBUG "mem_zero_phys_addr: 0x%llx\n", (phys_addr_t)MEM_ZERO_PHYS_ADDR);
++	printk(KERN_DEBUG "secondary_start_phys_addr: 0x%llx \n", secondary_start_phys_addr);
++	printk(KERN_DEBUG "secondary_start_virt_addr: 0x%llx \n", secondary_start_virt_addr);
++	printk(KERN_DEBUG "ttbr0_pgd_phys_addr: 0x%llx \n", (phys_addr_t)SECONDARY_INIT_TTBR0_L0_BASE);
++	printk(KERN_DEBUG "ttbr0_pgd_virt_addr: 0x%llx \n", ioremap_ttbr0_l0_virt_addr);
++	printk(KERN_DEBUG "ttbr0_pud_phys_addr: 0x%llx \n", (phys_addr_t)SECONDARY_INIT_TTBR0_L1_BASE);
++	printk(KERN_DEBUG "ttbr0_pud_virt_addr: 0x%llx \n", ioremap_ttbr0_l1_virt_addr);
++	printk(KERN_DEBUG "ttbr1_pud_phys_addr: 0x%llx \n", (phys_addr_t)SECONDARY_INIT_TTBR1_L1_BASE);
++	printk(KERN_DEBUG "ttbr1_pgd_phys_addr: 0x%llx \n", (phys_addr_t)SECONDARY_INIT_TTBR1_L0_BASE);
++	printk(KERN_DEBUG "ttbr1_pgd_virt_addr: 0x%llx \n", ioremap_ttbr1_l0_virt_addr);
++	printk(KERN_DEBUG "ttbr1_pud_phys_addr: 0x%llx \n", (phys_addr_t)SECONDARY_INIT_TTBR1_L1_BASE);
++
++	if (!ioremap_ttbr0_l0_virt_addr) {
++		printk(KERN_ERR "pgd table is not mapped....\n");
++		return 1;
++	}
++
++	/*TTBR0, 1:1 map lower for memory 0-2G, and secondary_start_phys_addr~secondary_start_phys_addr+1G */
++	setup_block_entry(MEM_ZERO_PHYS_ADDR, MEM_ZERO_PHYS_ADDR, 0);	
++	setup_block_entry(MEM_ZERO_PHYS_ADDR + MMU_BLOCK_SIZE, MEM_ZERO_PHYS_ADDR + MMU_BLOCK_SIZE, 0);	
++	setup_block_entry(secondary_start_phys_addr, secondary_start_phys_addr, 0);	
++
++	/*TTBR0 phys 0 - 0x3fff,ffff, CCSR, etc*/
++	setup_block_entry(0, 0, 0);
++
++	/* TTBR1 */
++	setup_block_entry(secondary_start_virt_base, secondary_start_phys_addr, 1);	
++
++	return 0;
++}
++
++#endif
++static int amp_secondary_start_binary_proc_show(struct seq_file *m, void *v)
++{
++	u8* image_addr = (u8 *)amp_secondary_start_virt_addr;
++
++	seq_printf(m, "This is reading bare metal binary, size: 0x%lx.\n", amp_binary_size);
++	if(secondary_start_phys_addr)
++		seq_printf(m, "Secondary core starts from 0x%llx, virt addr: 0x%llx\n", secondary_start_phys_addr, secondary_start_virt_addr);
++	else
++		seq_printf(m, "Secondary core starts phys address is not set.\n");
++	
++	for(; image_addr<(u8 *)(amp_secondary_start_virt_addr+amp_binary_size); image_addr++) {
++		if((phys_addr_t)image_addr % 0x10 == 0)
++			seq_printf(m, "\n0x%llx: ", (ioremap_phys_addr + (phys_addr_t)image_addr - ioremap_virt_addr));
++		seq_printf(m, "%02x ", *image_addr);
++	}
++
++	seq_printf(m, "\n ");
++	return 0;
++}
++static int amp_secondary_start_virt_addr_proc_show(struct seq_file *m, void *v)
++{
++	if(secondary_start_virt_addr)
++		seq_printf(m, "Secondary binary link addr: 0x%llx\n", secondary_start_virt_addr);
++	else
++		seq_printf(m, "Secondary core link phys address is not set.\n");
++	return 0;
++}
++static int amp_secondary_start_phys_addr_proc_show(struct seq_file *m, void *v)
++{
++	if(secondary_start_phys_addr)
++		seq_printf(m, "Secondary core starts from 0x%llx, virt addr: 0x%llx\n", secondary_start_phys_addr, secondary_start_virt_addr);
++	else
++		seq_printf(m, "Secondary core starts phys address is not set.\n");
++	return 0;
++}
++
++ssize_t amp_secondary_start_binary_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++	phys_addr_t dest_addr_offset = (secondary_start_virt_addr) & (MMU_BLOCK_SIZE - 1);
++
++	if(!amp_secondary_start_virt_base){
++		amp_secondary_start_virt_base = (phys_addr_t)ioremap(secondary_start_phys_addr, 0x1000000);
++		amp_secondary_start_virt_addr = amp_secondary_start_virt_base  + dest_addr_offset;
++	}
++
++	if(amp_binary_size == 0x4000){
++		unsigned long mydata = 0;
++		if(copy_from_user(&mydata, buf, 8))
++			return -EFAULT;
++	}
++
++	if(copy_from_user((void *)(amp_secondary_start_virt_addr + amp_binary_size), buf, count))
++    	    return -EFAULT;
++
++	mb();
++
++	amp_binary_size += count;
++
++	return count;
++}
++
++
++ssize_t amp_start_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++
++	char amp_start;
++
++	if (count != 2){
++		printk(KERN_ERR "Please echo 1 to start bare metal!\n");
++		return -EFAULT;
++	}
++
++	if(!amp_secondary_start_virt_base){
++		printk(KERN_ERR "amp_loader_memory is not mapped!");
++		return -EFAULT;
++	}
++
++	if(copy_from_user(&amp_start, buf, count-1))
++    	    return -EFAULT;
++
++	switch (amp_start) {
++	case '1':
++#if 0
++		printk(KERN_INFO "starting secondary core from amp_boot vir@0x%p phy@0x%llx \n", amp_boot, __pa_symbol(amp_boot));	
++#endif
++		break;
++	default:
++		printk(KERN_INFO "It is not a valid command, exiting...\n");
++		return -EFAULT;
++	}
++
++	//setup_secondary_mmu_table();
++
++	mb();
++
++	//amp_boot(1, 0);
++
++	return count;
++}
++
++ssize_t amp_secondary_start_virt_addr_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++
++	char local_buf[20];
++	unsigned long myaddr = 0x12345678;
++	memset(local_buf, 0, 20);
++	if (copy_from_user(local_buf, buf, count)) {
++		printk(KERN_INFO "Failed to copy from user\n");
++		return -EFAULT;
++	}
++
++	if (kstrtoul(local_buf, 16, &myaddr)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, myaddr: 0x%lx, count=%ld\n", local_buf, myaddr, count);
++		return -EFAULT;
++	}
++
++	secondary_start_virt_addr = myaddr;
++
++	return count;
++}	
++ssize_t amp_secondary_start_phys_addr_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++
++	char local_buf[20];
++	unsigned long myaddr = 0x12345678;
++	memset(local_buf, 0, 20);
++	if (copy_from_user(local_buf, buf, count)) {
++		printk(KERN_INFO "Failed to copy from user\n");
++		return -EFAULT;
++	}
++
++	if (kstrtoul(local_buf, 16, &myaddr)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, myaddr: 0x%lx, count=%ld\n", local_buf, myaddr, count);
++		return -EFAULT;
++	}
++
++	if(myaddr & (MMU_BLOCK_SIZE - 1)) {
++		printk(KERN_INFO "Error! phys addr is not block size aligned!\n");
++		return -EFAULT;
++	}
++
++	secondary_start_phys_addr = myaddr;
++
++	printk(KERN_INFO "Setting up secondary start phys addr: 0x%llx \n", secondary_start_phys_addr);
++	mb();
++	dsb(sy);
++	isb();
++
++	if(amp_secondary_start_virt_base) {
++		iounmap((void *)amp_secondary_start_virt_base);
++	}
++
++	amp_secondary_start_virt_base = 0;
++	amp_secondary_start_virt_addr = 0;
++	amp_binary_size = 0;
++
++	return count; 
++}
++
++static int amp_secondary_start_binary_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,amp_secondary_start_binary_proc_show, PDE_DATA(inode_ptr));
++}
++static int amp_secondary_start_virt_addr_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,amp_secondary_start_virt_addr_proc_show, PDE_DATA(inode_ptr));
++}
++
++static int amp_secondary_start_phys_addr_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,amp_secondary_start_phys_addr_proc_show, PDE_DATA(inode_ptr));
++}
++#ifdef DEBUG
++static int ioremap_data_proc_show(struct seq_file *m, void *v)
++{
++	u8* image_addr = (u8 *)ioremap_virt_addr;
++
++	if(ioremap_virt_addr)
++		seq_printf(m, "This is dumpping data virt@0x%llx, phys@0x%llx, size: 0x%lx.\n", ioremap_virt_addr, ioremap_phys_addr, ioremap_length);
++	else {
++		seq_printf(m, "Dump address address is not set, please setup ioremap_addr and ioremap_length accordingly\n");
++		return 1;
++	}
++
++	
++#if 1
++	for(; image_addr<(u8 *)(ioremap_virt_addr + ioremap_length); image_addr++) {
++		if((phys_addr_t)image_addr % 0x10 == 0) {
++			seq_printf(m, "\n0x%llx:  ", (ioremap_phys_addr + (phys_addr_t)image_addr - ioremap_virt_addr));
++		}
++		seq_printf(m, "%02x ", *image_addr);
++	}
++#endif
++
++	seq_printf(m, "\n ");
++	//seq_printf(m, "TestData: mapping amp_mem phy_addr:0x%p @0x%p, content: 0x%08lx\n", (void *)ioremap_phys_addr, ioremap_virt_addr, *(unsigned long *)((u64)ioremap_virt_addr));
++	return 0;
++}
++static int ioremap_length_proc_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "TestData: mapped size: 0x%lx\n", ioremap_length);
++	return 0;
++}
++
++static int ioremap_virt_addr_proc_show(struct seq_file *m, void *v)
++{
++	if(ioremap_virt_addr)
++		seq_printf(m, "TestData: mapping amp_mem phy_addr:0x%llx @0x%llx, content: 0x%08lx\n", ioremap_phys_addr, ioremap_virt_addr, *(unsigned long *)(ioremap_virt_addr));
++	return 0;
++}
++
++static int amp_virt_addr_proc_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "This is reading virt addr@0x%llx, phys addr@0x%llx, contenet: 0x%llx.\n", amp_virt_addr, __virt_to_phys(amp_virt_addr),  *(u64 *)amp_virt_addr);
++	return 0;
++}
++
++ssize_t amp_virt_addr_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++	char local_buf[20];
++	unsigned long myaddr = 0x12345678;
++
++	memset(local_buf, 0, 20);
++
++	if (copy_from_user(local_buf, buf, count)) {
++		printk(KERN_INFO "Failed to copy from user\n");
++		return -EFAULT;
++	}	
++
++	if (kstrtoul(local_buf, 16, &myaddr)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, myaddr: 0x%lx\n", local_buf, myaddr);
++	}
++
++	printk(KERN_INFO "You are writing %ld bytes! Setting virt addr as 0x%lx\n", count, myaddr);
++
++	amp_virt_addr = myaddr;
++	
++	return count;
++	
++}
++
++static int amp_virt_data_proc_show(struct seq_file *m, void *v)
++{
++	
++	seq_printf(m, "This is reading virt addr@0x%llx, contenet: 0x%llx.\n", amp_virt_addr, *(phys_addr_t *)amp_virt_addr);
++	return 0;
++}
++ssize_t amp_virt_data_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++
++	char local_buf[20];
++
++	unsigned long mydata = 0xdeadbeefdeadbeef;
++	memset(local_buf, 0, 20);
++
++	if(!amp_virt_addr){
++		printk( "virt addr is not set!\n");
++		return -EFAULT; 
++	}
++
++	if (copy_from_user(local_buf, buf, count)) 
++    	    return -EFAULT;
++
++	if (kstrtoul(local_buf, 16, &mydata)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, mydata: 0x%lx, count=%ld\n", local_buf, mydata, count);
++		return -EFAULT;
++	}
++
++
++	*(unsigned long *)amp_virt_addr = mydata;
++
++	printk(KERN_INFO "You are writing %d bytes! content: 0x%llx \n", (int)count, *(u64 *)buf);
++
++	return count;
++}
++
++ssize_t ioremap_data_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++	char local_buf[20];
++
++	unsigned long mydata = 0xdeadbeef;
++	memset(local_buf, 0, 20);
++
++	if(!ioremap_virt_addr){
++		printk(KERN_INFO "amp_loader_memory is not mapped!");
++		return -EFAULT;
++	}
++	if (copy_from_user(local_buf, buf, count)) 
++    	    return -EFAULT;
++
++	if (kstrtoul(local_buf, 16, &mydata)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, mydata: 0x%lx, count=%ld\n", local_buf, mydata, count);
++		return -EFAULT;
++	}
++
++	/*memset(ioremap_virt_addr, mydata, 4);*/
++	*(unsigned long *)((u64)ioremap_virt_addr) = mydata;
++
++	printk(KERN_INFO "You are writing %d bytes!, data: 0x%lx @0x%llx, content: 0x%lx\n", (int)count, mydata, ioremap_virt_addr, *(unsigned long *)(ioremap_virt_addr));
++
++	return count;
++}
++ssize_t ioremap_length_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++	char local_buf[20];
++	unsigned long mydata = 0x12345678;
++	memset(local_buf, 0, 20);
++	if (copy_from_user(local_buf, buf, count)) {
++		printk(KERN_INFO "Failed to copy from user\n");
++		return -EFAULT;
++	}
++
++	if (kstrtoul(local_buf, 16, &mydata)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, myaddr: 0x%lx, count=%ld\n", local_buf, mydata, count);
++		return -EFAULT;
++	}
++
++	ioremap_length = mydata;
++
++	if(ioremap_phys_addr && ioremap_virt_addr) {
++		iounmap((void *)ioremap_virt_addr);
++		ioremap_virt_addr = (phys_addr_t)ioremap(ioremap_phys_addr, ioremap_length);
++		printk(KERN_INFO "Remap virt@0x%llx phys@0x%llx size: 0x%lx \n", ioremap_virt_addr, ioremap_phys_addr, ioremap_length);
++	}
++
++	printk(KERN_INFO "Setting map size 0x%lx\n", ioremap_length);
++	return count;	
++}
++ssize_t ioremap_virt_addr_proc_write(struct file *file,const char __user *buf, size_t count, loff_t *data )
++{
++	char local_buf[20];
++	unsigned long myaddr = 0x12345678;
++	memset(local_buf, 0, 20);
++	if (copy_from_user(local_buf, buf, count)) {
++		printk(KERN_INFO "Failed to copy from user\n");
++		return -EFAULT;
++	}
++
++	if (kstrtoul(local_buf, 16, &myaddr)) {
++		printk(KERN_INFO "Failed to translate string to unsigned int! local_buf:%s, myaddr: 0x%lx, count=%ld\n", local_buf, myaddr, count);
++		return -EFAULT;
++	}
++
++	ioremap_phys_addr = myaddr;
++
++	if(ioremap_virt_addr) {
++		iounmap((void *)ioremap_virt_addr);
++	}
++
++	if(ioremap_length)
++		ioremap_virt_addr = (phys_addr_t)ioremap(ioremap_phys_addr, ioremap_length);
++	else {
++		ioremap_virt_addr = (phys_addr_t)ioremap(ioremap_phys_addr, sizeof(unsigned long));
++		ioremap_length = sizeof(unsigned long);
++	}
++
++	printk(KERN_INFO "Mapped phys@0x%llx, virt base: 0x%llx, length: 0x%lx\n", ioremap_phys_addr, ioremap_virt_addr, ioremap_length);
++	return count;	
++}
++
++static int amp_virt_addr_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,amp_virt_addr_proc_show, PDE_DATA(inode_ptr));
++}
++static int amp_virt_data_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,amp_virt_data_proc_show, PDE_DATA(inode_ptr));
++}
++static int ioremap_data_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp, ioremap_data_proc_show, PDE_DATA(inode_ptr));
++}
++static int ioremap_virt_addr_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,ioremap_virt_addr_proc_show, PDE_DATA(inode_ptr));
++}
++
++static int ioremap_length_proc_open(struct inode *inode_ptr, struct file *fp)
++{
++	return single_open(fp,ioremap_length_proc_show, PDE_DATA(inode_ptr));
++}
++#endif
++
++static const struct file_operations amp_start_proc_fops = {
++	.write = amp_start_proc_write,
++};
++static const struct file_operations amp_secondary_start_binary_proc_fops = {
++	.open = amp_secondary_start_binary_proc_open,
++	.read = seq_read,
++	.write = amp_secondary_start_binary_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++static const struct file_operations amp_secondary_start_virt_addr_proc_fops = {
++	.open = amp_secondary_start_virt_addr_proc_open,
++	.read = seq_read,
++	.write = amp_secondary_start_virt_addr_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++static const struct file_operations amp_secondary_start_phys_addr_proc_fops = {
++	.open = amp_secondary_start_phys_addr_proc_open,
++	.read = seq_read,
++	.write = amp_secondary_start_phys_addr_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++#ifdef DEBUG
++static const struct file_operations amp_virt_data_proc_fops = {
++	.open = amp_virt_data_proc_open,
++	.read = seq_read,
++	.write = amp_virt_data_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static const struct file_operations amp_virt_addr_proc_fops = {
++	.open = amp_virt_addr_proc_open,
++	.read = seq_read,
++	.write = amp_virt_addr_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static const struct file_operations ioremap_data_proc_fops = {
++	.open = ioremap_data_proc_open,
++	.read = seq_read,
++	.write = ioremap_data_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static const struct file_operations ioremap_length_proc_fops = {
++	.open = ioremap_length_proc_open,
++	.read = seq_read,
++	.write = ioremap_length_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static const struct file_operations ioremap_virt_addr_proc_fops = {
++	.open = ioremap_virt_addr_proc_open,
++	.read = seq_read,
++	.write = ioremap_virt_addr_proc_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++#endif
++void init_amp_proc(void){
++
++	struct proc_dir_entry *pde;
++
++#if 0
++	amp_addr = (phys_addr_t)ioremap(amp_phy_addr, amp_size);
++#endif
++
++	amp_dir = proc_mkdir("amp_loader",NULL);
++	if(!amp_dir)
++		goto err1;
++
++	pde = proc_create("amp_loader/secondary_start_binary",S_IRUGO | \
++			S_IWUGO,NULL,&amp_secondary_start_binary_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/secondary_start_virt_addr",S_IRUGO | \
++			S_IWUGO,NULL,&amp_secondary_start_virt_addr_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/secondary_start_phys_addr",S_IRUGO | \
++			S_IWUGO,NULL,&amp_secondary_start_phys_addr_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/start",S_IRUGO | \
++			S_IWUGO,NULL,&amp_start_proc_fops);
++	if(!pde)
++		goto err2;
++#ifdef DEBUG
++	pde = proc_create("amp_loader/virt_data",S_IRUGO | \
++			S_IWUGO,NULL,&amp_virt_data_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/virt_addr",S_IRUGO | \
++			S_IWUGO,NULL,&amp_virt_addr_proc_fops);
++	if(!pde)
++		goto err2;
++
++	pde = proc_create("amp_loader/ioremap_addr",S_IRUGO | \
++			S_IWUGO,NULL,&ioremap_virt_addr_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/ioremap_length",S_IRUGO | \
++			S_IWUGO,NULL,&ioremap_length_proc_fops);
++	if(!pde)
++		goto err2;
++	pde = proc_create("amp_loader/ioremap_data",S_IRUGO | \
++			S_IWUGO,NULL,&ioremap_data_proc_fops);
++	if(!pde)
++		goto err2;
++	//printk(KERN_INFO "proc entries are created! amp_phy_addr: 0x%llx virt addr: 0x%llx \n", amp_phy_addr, amp_addr);
++#endif
++	return;
++err1:
++	printk(KERN_INFO "Failed to creare /proc/amp \n");
++	return;
++err2:
++	printk(KERN_INFO "Faied to create /proc/amp/xxx \n");
++}
++
++int proc_init(void)
++{
++	init_amp_proc();
++	printk(KERN_INFO "AMP loader is installed! \n");
++
++	return 0;
++}
++
++void proc_cleanup(void)
++{
++	if (amp_secondary_start_virt_base)
++		iounmap((void *)amp_secondary_start_virt_base);
++
++	if(secondary_start_phys_addr)
++		secondary_start_phys_addr = 0;
++	if(secondary_start_virt_addr)
++		secondary_start_virt_addr = 0;
++
++#ifdef DEBUG
++	if (ioremap_virt_addr)
++		iounmap((void *)ioremap_virt_addr);
++	remove_proc_entry("amp_loader/virt_addr", NULL);
++	remove_proc_entry("amp_loader/virt_data", NULL);
++	remove_proc_entry("amp_loader/ioremap_addr", NULL);
++	remove_proc_entry("amp_loader/ioremap_length", NULL);
++	remove_proc_entry("amp_loader/ioremap_data", NULL);
++#endif
++	remove_proc_entry("amp_loader/secondary_start_binary", NULL);
++	remove_proc_entry("amp_loader/secondary_start_phys_addr", NULL);
++	remove_proc_entry("amp_loader/secondary_start_virt_addr", NULL);
++	remove_proc_entry("amp_loader/start", NULL);
++	remove_proc_entry("amp_loader", NULL);
++	printk(KERN_INFO "AMP loader is removed! \n");
++}
++
++
++module_init(proc_init);
++module_exit(proc_cleanup);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Yunguo Wei");	
++MODULE_DESCRIPTION("AMP loader");	
+-- 
+2.13.3
+

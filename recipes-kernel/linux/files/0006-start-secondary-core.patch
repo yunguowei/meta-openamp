@@ -1,0 +1,191 @@
+From 50c1cb152294af97b1adfa2be92315664cac9b4e Mon Sep 17 00:00:00 2001
+From: Yunguo Wei <yunguo.wei@windriver.com>
+Date: Tue, 12 Mar 2019 09:57:27 +0000
+Subject: [PATCH 6/6] start secondary core
+
+Signed-off-by: Yunguo Wei <yunguo.wei@windriver.com>
+---
+ arch/arm64/kernel/psci.c                   | 13 ++++++++++++
+ drivers/remoteproc/remoteproc_core.c       |  2 +-
+ drivers/remoteproc/remoteproc_elf_loader.c |  8 ++------
+ drivers/remoteproc/zynqmp_a53_remoteproc.c | 33 +++++++++++++++++++++---------
+ 4 files changed, 39 insertions(+), 17 deletions(-)
+
+diff --git a/arch/arm64/kernel/psci.c b/arch/arm64/kernel/psci.c
+index e8edbf13302a..368eac1c4ef1 100644
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -53,6 +53,19 @@ static int cpu_psci_cpu_boot(unsigned int cpu)
+ 	return err;
+ }
+ 
++int amp_boot(unsigned int cpu, phys_addr_t start_phys_addr)
++{
++        int err = 0;
++
++        err = psci_ops.cpu_on(cpu_logical_map(cpu), start_phys_addr);
++        if (err)
++                pr_err("failed to boot CPU%d (%d), start phys addr: 0x%llx\n", cpu, err, start_phys_addr);
++
++        return err;
++}
++
++EXPORT_SYMBOL(amp_boot);
++
+ #ifdef CONFIG_HOTPLUG_CPU
+ static int cpu_psci_cpu_disable(unsigned int cpu)
+ {
+diff --git a/drivers/remoteproc/remoteproc_core.c b/drivers/remoteproc/remoteproc_core.c
+index 37edd5235206..e8b1de7627cf 100644
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@ -1080,7 +1080,7 @@ static int rproc_start(struct rproc *rproc, const struct firmware *fw)
+ 		rproc->table_ptr = loaded_table;
+ 	}
+ 
+-#if 0
++#if 1
+ 	/* power up the remote processor */
+ 	ret = rproc->ops->start(rproc);
+ 	if (ret) {
+diff --git a/drivers/remoteproc/remoteproc_elf_loader.c b/drivers/remoteproc/remoteproc_elf_loader.c
+index 5fc13e909cf7..05391b929a66 100644
+--- a/drivers/remoteproc/remoteproc_elf_loader.c
++++ b/drivers/remoteproc/remoteproc_elf_loader.c
+@@ -564,7 +564,6 @@ int rproc_elf64_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 	int i, ret = 0;
+ 	const u8 *elf_data = fw->data;
+ 
+-	pr_warn("%s(%d): loading elf images!\n", __FILE__, __LINE__);
+ 	ehdr = (struct elf64_hdr *)elf_data;
+ 	phdr = (struct elf64_phdr *)(elf_data + ehdr->e_phoff);
+ 
+@@ -578,13 +577,10 @@ int rproc_elf64_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 
+ 		if (phdr->p_type != PT_LOAD)
+ 			continue;
+-#if 0
++
+ 		dev_dbg(dev, "phdr: type %d da 0x%llx memsz 0x%llx filesz 0x%llx\n",
+ 			phdr->p_type, da, memsz, filesz);
+-#else
+-		pr_warn("%s(%d): phdr: type %d da 0x%llx memsz 0x%llx filesz 0x%llx\n",
+-				__FILE__, __LINE__, phdr->p_type, da, memsz, filesz);
+-#endif
++
+ 		if (filesz > memsz) {
+ 			dev_err(dev, "bad phdr filesz 0x%llx memsz 0x%llx\n",
+ 				filesz, memsz);
+diff --git a/drivers/remoteproc/zynqmp_a53_remoteproc.c b/drivers/remoteproc/zynqmp_a53_remoteproc.c
+index 1703b33d721a..2ec119ece8bd 100644
+--- a/drivers/remoteproc/zynqmp_a53_remoteproc.c
++++ b/drivers/remoteproc/zynqmp_a53_remoteproc.c
+@@ -41,6 +41,7 @@
+ 
+ #include "remoteproc_internal.h"
+ 
++extern int amp_boot(unsigned int cpu, phys_addr_t phys_start_addr);
+ /* Register offset definitions for RPU. */
+ #define RPU_GLBL_CNTL_OFFSET	0x00000000 /* RPU control */
+ 
+@@ -149,6 +150,7 @@ struct zynqmp_a53_rproc_pdata {
+ 	u32 rpu_id;
+ 	u32 rpu_pd_id;
+ 	int vring0;
++	u64 boot_addr;
+ };
+ 
+ /**
+@@ -342,6 +344,16 @@ static void handle_event_notified(struct work_struct *work)
+ 	idr_for_each(&rproc->notifyids, event_notified_idr_cb, rproc);
+ }
+ 
++#if 1
++static int zynqmp_a53_rproc_start(struct rproc *rproc)
++{
++	struct zynqmp_a53_rproc_pdata *local = rproc->priv;
++
++	amp_boot(1, local->boot_addr);
++
++	return 0;
++}
++#else
+ static int zynqmp_a53_rproc_start(struct rproc *rproc)
+ {
+ 	struct device *dev = rproc->dev.parent;
+@@ -384,7 +396,7 @@ static int zynqmp_a53_rproc_start(struct rproc *rproc)
+ 
+ 	return 0;
+ }
+-
++#endif
+ /* kick a firmware */
+ static void zynqmp_a53_rproc_kick(struct rproc *rproc, int vqid)
+ {
+@@ -455,11 +467,9 @@ static void *zynqmp_a53_rproc_da_to_va(struct rproc *rproc, u64 da, int len)
+ 	void *va = NULL;
+ 	struct zynqmp_a53_rproc_pdata *local = rproc->priv;
+ 
+-	pr_warn("%s(%d): da: 0x%llx, len: 0x%x\n", __FILE__, __LINE__, da, len);
+ 	list_for_each_entry(mem, &local->mems, node) {
+ 		int offset = da - mem->da;
+ 
+-		pr_warn("%s(%d): da: 0x%llx, len: 0x%x, mem->da: 0x%x, offset: 0x%x, mem->len: 0x%x\n", __FILE__, __LINE__, da, len, mem->da, offset, mem->len);
+ 		/* try next carveout if da is too small */
+ 		if (offset < 0)
+ 			continue;
+@@ -475,6 +485,15 @@ static void *zynqmp_a53_rproc_da_to_va(struct rproc *rproc, u64 da, int len)
+ 	return va;
+ }
+ 
++static u64 zynqmp_a53_rproc_elf64_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
++{
++	struct zynqmp_a53_rproc_pdata *local = rproc->priv;
++
++	local->boot_addr = rproc_elf64_get_boot_addr(rproc, fw);
++
++	return local->boot_addr;
++}
++
+ static struct rproc_ops zynqmp_a53_rproc_ops = {
+ 	.start		= zynqmp_a53_rproc_start,
+ 	.stop		= zynqmp_a53_rproc_stop,
+@@ -486,7 +505,7 @@ static struct rproc_ops zynqmp_a53_rproc_ops = {
+ 	.find_loaded_rsc_table	= rproc_elf64_find_loaded_rsc_table,
+ 	.sanity_check	= rproc_elf64_sanity_check,
+ 	.get_chksum	= rproc_elf64_get_chksum,
+-	.get_boot_addr	= rproc_elf64_get_boot_addr,
++	.get_boot_addr	= zynqmp_a53_rproc_elf64_get_boot_addr,
+ 	
+ };
+ 
+@@ -545,10 +564,6 @@ static int zynqmp_a53_rproc_init(struct rproc *rproc)
+ 	struct zynqmp_a53_rproc_pdata *local = rproc->priv;
+ 	int ret;
+ 
+-	dev_dbg(dev, "%s\n", __func__);
+-#if 1
+-	pr_warn("%s(%d) rproc init \n", __FILE__, __LINE__);
+-#endif
+ 	ret = a53_request_tcm(local);
+ 	if (ret)
+ 		return ret;
+@@ -650,7 +665,6 @@ static int zynqmp_a53_remoteproc_probe(struct platform_device *pdev)
+ 		prop = "lock-step";
+ 	}
+ 
+-	dev_info(&pdev->dev, "RPU core_conf: %s\n", prop);
+ 	if (!strcmp(prop, "split0")) {
+ 		local->rpu_mode = SPLIT;
+ 		local->rpu_id = 0;
+@@ -713,7 +727,6 @@ static int zynqmp_a53_remoteproc_probe(struct platform_device *pdev)
+ 					   srams_name, i);
+ 
+ 		if (mem_pool) {
+-			pr_warn("%s(%d): Adding sram pool %s \n", __FILE__, __LINE__, mem_pool->name);
+ 			mem_node = devm_kzalloc(&pdev->dev,
+ 						sizeof(struct mem_pool_st),
+ 					GFP_KERNEL);
+-- 
+2.13.3
+

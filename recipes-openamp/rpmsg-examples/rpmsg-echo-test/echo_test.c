@@ -1,5 +1,4 @@
-/*
- * echo_test.c
+/* * echo_test.c
  *
  *  Created on: Oct 4, 2014
  *      Author: etsam
@@ -32,9 +31,11 @@ struct _payload {
 };
 
 static int charfd = -1, fd = -1, err_cnt;
+char *ept_name;
 
 struct _payload *i_payload;
 struct _payload *r_payload;
+char *r_buff;
 
 #define RPMSG_GET_KFIFO_SIZE 1
 #define RPMSG_GET_AVAIL_DATA_SIZE 2
@@ -44,9 +45,11 @@ struct _payload *r_payload;
 #define MAX_RPMSG_BUFF_SIZE (512 - RPMSG_HEADER_LEN)
 #define PAYLOAD_MIN_SIZE	1
 #define PAYLOAD_MAX_SIZE	(MAX_RPMSG_BUFF_SIZE - 24)
-#define NUM_PAYLOADS		(PAYLOAD_MAX_SIZE/PAYLOAD_MIN_SIZE)
+//#define NUM_PAYLOADS		(PAYLOAD_MAX_SIZE/PAYLOAD_MIN_SIZE)
+#define NUM_PAYLOADS		10
 
 #define RPMSG_BUS_SYS "/sys/bus/rpmsg"
+#define DEFAULT_EPT_NAME "rpmsg-openamp-demo-channel"
 
 static int rpmsg_create_ept(int rpfd, struct rpmsg_endpoint_info *eptinfo)
 {
@@ -103,17 +106,36 @@ static int bind_rpmsg_chrdev(const char *rpmsg_dev_name)
 	char *rpmsg_chdrv = "rpmsg_chrdev";
 	int fd;
 	int ret;
-
+	char driver_override_name[64];	
 
 	/* rpmsg dev overrides path */
 	sprintf(fpath, "%s/devices/%s/driver_override",
 		RPMSG_BUS_SYS, rpmsg_dev_name);
+
+	//printf("checking %s\n", fpath);
+
+	if (access(fpath, F_OK) == 0) {
+		FILE *fp = fopen(fpath, "r");
+		if (fp) {
+			//printf("Getting driver_override\n");
+			fgets(driver_override_name, sizeof(driver_override_name), fp);
+			fclose(fp);
+			//printf("driver_override: %s\n", driver_override_name);
+			if (!strncmp(rpmsg_chdrv, driver_override_name, sizeof(rpmsg_chdrv))){
+				printf("dev has been initialized!\n");
+				return 0;
+			}
+		} else
+			printf("failed to open %s\n", fpath);
+	}
 	fd = open(fpath, O_WRONLY);
+
 	if (fd < 0) {
 		fprintf(stderr, "Failed to open %s, %s\n",
 			fpath, strerror(errno));
 		return -EINVAL;
 	}
+
 	ret = write(fd, rpmsg_chdrv, strlen(rpmsg_chdrv) + 1);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to write %s to %s, %s\n",
@@ -149,6 +171,7 @@ static int get_rpmsg_chrdev_fd(const char *rpmsg_dev_name,
 	DIR *dir;
 	struct dirent *ent;
 	int fd;
+	int i;
 
 	sprintf(dpath, "%s/devices/%s/rpmsg", RPMSG_BUS_SYS, rpmsg_dev_name);
 	dir = opendir(dpath);
@@ -160,6 +183,23 @@ static int get_rpmsg_chrdev_fd(const char *rpmsg_dev_name,
 		if (!strncmp(ent->d_name, rpmsg_ctrl_prefix,
 			    strlen(rpmsg_ctrl_prefix))) {
 			printf("Opening file %s.\n", ent->d_name);
+			//check if ept is available ...
+			for (i = 0; i<128; i++) {
+				FILE *fp;
+				char ept_avail[64];
+				sprintf(fpath, "%s/%s/rpmsg%d/name", dpath, ent->d_name, i);
+				fp = fopen(fpath, "r");
+				if (!fp) {
+					//printf("failed to open %s\n", fpath);
+					continue;
+				}
+				fgets(ept_avail, sizeof(ept_avail), fp);
+				fclose(fp);
+				printf("found ept available: %s.\n",ept_avail);
+				if(!strncmp(ept_avail, ept_name, strlen(ept_name)))
+					return 0;
+			}
+
 			sprintf(fpath, "/dev/%s", ent->d_name);
 			fd = open(fpath, O_RDWR | O_NONBLOCK);
 			if (fd < 0) {
@@ -183,22 +223,30 @@ int main(int argc, char *argv[])
 	int size, bytes_rcvd, bytes_sent;
 	err_cnt = 0;
 	int opt;
-	char *rpmsg_dev="virtio0.rpmsg-openamp-demo-channel.-1.0";
+	char *rpmsg_dev="virtio0";
 	int ntimes = 1;
 	char fpath[256];
 	char rpmsg_char_name[16];
 	struct rpmsg_endpoint_info eptinfo;
 	char ept_dev_name[16];
 	char ept_dev_path[32];
+	
+	ept_name = DEFAULT_EPT_NAME;
 
-
-	while ((opt = getopt(argc, argv, "d:n:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:n:e:")) != -1) {
 		switch (opt) {
 		case 'd':
 			rpmsg_dev = optarg;
 			break;
 		case 'n':
 			ntimes = atoi(optarg);
+			break;
+		case 'e':
+			if(strlen(optarg) > 32) {
+				printf("End point name is longer that maximum length 32, aborting...\r\n");
+				return -EINVAL;
+			}
+			ept_name = optarg;
 			break;
 		default:
 			printf("getopt return unsupported option: -%c\n",opt);
@@ -230,18 +278,22 @@ int main(int argc, char *argv[])
 		return charfd;
 
 	/* Create endpoint from rpmsg char driver */
-	strcpy(eptinfo.name, "rpmsg-openamp-demo-channel");
+	strcpy(eptinfo.name, ept_name);
 	eptinfo.src = 0;
 	eptinfo.dst = 0xFFFFFFFF;
-	ret = rpmsg_create_ept(charfd, &eptinfo);
-	if (ret) {
-		printf("failed to create RPMsg endpoint.\n");
-		return -EINVAL;
+
+	if (charfd > 0) {
+		ret = rpmsg_create_ept(charfd, &eptinfo);
+		if (ret) {
+			printf("failed to create RPMsg endpoint.\n");
+			return -EINVAL;
+		}
 	}
 	if (!get_rpmsg_ept_dev_name(rpmsg_char_name, eptinfo.name,
 				    ept_dev_name))
 		return -EINVAL;
 	sprintf(ept_dev_path, "/dev/%s", ept_dev_name);
+	printf("Opening ept dev: %s\n", ept_dev_path);
 	fd = open(ept_dev_path, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
 		perror("Failed to open rpmsg device.");
@@ -251,6 +303,7 @@ int main(int argc, char *argv[])
 
 	i_payload = (struct _payload *)malloc(2 * sizeof(unsigned long) + PAYLOAD_MAX_SIZE);
 	r_payload = (struct _payload *)malloc(2 * sizeof(unsigned long) + PAYLOAD_MAX_SIZE);
+	r_buff = (char *)r_payload;
 
 	if (i_payload == 0 || r_payload == 0) {
 		printf("ERROR: Failed to allocate memory for payload.\n");
@@ -260,7 +313,7 @@ int main(int argc, char *argv[])
 	for (j=0; j < ntimes; j++){
 		printf("\r\n **********************************");
 		printf("****\r\n");
-		printf("\r\n  Echo Test Round %d \r\n", j);
+		printf("\r\n  Echo Test Round %d: send %d msg \r\n", j, NUM_PAYLOADS);
 		printf("\r\n **********************************");
 		printf("****\r\n");
 		for (i = 0, size = PAYLOAD_MIN_SIZE; i < NUM_PAYLOADS;
@@ -274,7 +327,7 @@ int main(int argc, char *argv[])
 			memset(&(i_payload->data[0]), 0xA5, size);
 
 			printf("\r\n sending payload number");
-			printf(" %ld of size %d\r\n", i_payload->num,
+			printf(" %ld of %d with size %ld\r\n", (i_payload->num + 1), NUM_PAYLOADS,
 			(2 * sizeof(unsigned long)) + size);
 
 			bytes_sent = write(fd, i_payload,
@@ -285,7 +338,7 @@ int main(int argc, char *argv[])
 				printf(" .. \r\n");
 				break;
 			}
-			printf("echo test: sent : %d\n", bytes_sent);
+			//printf("echo test: sent : %d\n", bytes_sent);
 
 			r_payload->num = 0;
 			bytes_rcvd = read(fd, r_payload,
@@ -296,7 +349,7 @@ int main(int argc, char *argv[])
 					(2 * sizeof(unsigned long)) + PAYLOAD_MAX_SIZE);
 			}
 			printf(" received payload number ");
-			printf("%ld of size %d\r\n", r_payload->num, bytes_rcvd);
+			printf("%ld of %d with size %d\r\n", (r_payload->num+1), NUM_PAYLOADS, bytes_rcvd);
 
 			/* Validate data buffer integrity. */
 			for (k = 0; k < r_payload->size; k++) {
@@ -320,10 +373,10 @@ int main(int argc, char *argv[])
 		printf("****\r\n");
 	}
 
+	close(fd);
 	free(i_payload);
 	free(r_payload);
 
-	close(fd);
 	if (charfd >= 0)
 		close(charfd);
 	return 0;
